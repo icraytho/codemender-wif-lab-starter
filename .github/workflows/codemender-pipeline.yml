@@ -17,7 +17,7 @@ permissions:
 env:
   SCAN_PATH: routes
   CM_BUNDLED: lab/bin/cm-linux
-  CM_FIX_LIMIT: "3"
+  CM_FIX_LIMIT: "1"
 
 jobs:
   codemender-security:
@@ -82,12 +82,15 @@ jobs:
         if: ${{ github.event_name != 'pull_request' && steps.triage.outputs.fix_ids != '' }}
         run: |
           set -uo pipefail
+          FIX_COUNT=0
           for FID in ${{ steps.triage.outputs.fix_ids }}; do
             cm fix "$FID" -y --bypass-warning 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
             python3 .github/scripts/extract_cm_diff.py "$RUNNER_TEMP/fix-$FID.cm.log" > "$RUNNER_TEMP/fix-$FID.patch" || true
             if [ -s "$RUNNER_TEMP/fix-$FID.patch" ] && git apply --check -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
               git apply -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch"
             fi
+            FIX_COUNT=$((FIX_COUNT+1))
+            [ "$FIX_COUNT" -ge "$CM_FIX_LIMIT" ] && break
           done
 
       - name: Open Remediation Pull Request
