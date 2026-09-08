@@ -18,7 +18,7 @@ env:
   SCAN_PATH: src/services
   CM_BUNDLED: lab/bin/cm-linux
   CM_FIX_LIMIT: "1"
-  CM_MODEL: gemini-3.8-flash
+  CM_MODEL: gemini-3.7-flash
 
 jobs:
   codemender-security:
