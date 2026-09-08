@@ -1,0 +1,14 @@
+rules:
+  - id: cm-harvested-os-command-injection
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "Shell command built from untrusted input — CodeMender confirmed vulnerability. Use execFile with an argument array instead of a raw shell string."
+    patterns:
+      - pattern-either:
+          - pattern: "$CP.exec($A + $B, ...)"
+          - pattern: "$CP.execSync($A + $B, ...)"
+          - pattern: "$CP.exec(`...${$X}...`, ...)"
+    metadata:
+      cwe: "CWE-78"
+      source: "codemender-harvested"
+      confidence: "HIGH"
