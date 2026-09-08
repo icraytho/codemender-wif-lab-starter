@@ -5,7 +5,7 @@ const fs = require('fs');
 exports.checkout = async (req, res) => {
     try {
         const result = await checkoutService.processOrder(req.body.item, req.body.quantity);
-        res.send(result);
+        res.json(result);
     } catch (e) {
         res.status(400).send(e.message);
     }

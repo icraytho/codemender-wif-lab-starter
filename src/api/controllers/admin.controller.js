@@ -1,7 +1,7 @@
 const adminService = require('../../services/admin.service');
 
 exports.checkShippingStatus = (req, res) => {
-    adminService.pingProvider(req.body.providerIP, req.body.options, out => res.send({ logs: out }));
+    adminService.pingProvider(req.body.providerIP, req.body.options, out => res.send(out));
 };
 
 exports.previewDynamicPricing = (req, res) => {
