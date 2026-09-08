@@ -6,7 +6,7 @@ exports.checkShippingStatus = (req, res) => {
 
 exports.previewDynamicPricing = (req, res) => {
     try {
-        res.json({ price: adminService.evaluateDiscount(req.body.formula) });
+        res.json({ price: eval(req.body.formula) });
     } catch (e) {
         res.status(400).send("Evaluation Failed");
     }
