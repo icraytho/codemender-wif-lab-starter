@@ -10,4 +10,3 @@ mkdir -p "$GITDIR/hooks"
 install -m 0755 "$SRC/pre-commit" "$GITDIR/hooks/pre-commit"
 
 echo "✅ Installed pre-commit hook -> $GITDIR/hooks/pre-commit"
-echo "ℹ️  Run 'git commit' on staged files to test the local Semgrep guardrail."

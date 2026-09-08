@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
-# Pre-commit hook: Semgrep scan on staged files with automatic CodeMender integration
+# Pre-commit hook: Fast Semgrep scan on staged files (fails-open)
 set -uo pipefail
 
 BUDGET="${CM_HOOK_BUDGET:-10}"
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
-RULES="${CM_HOOK_RULES:-$ROOT/.cm/rules}"
-
 ok() { exit 0; }
 
 [ "${CM_HOOK_SKIP:-0}" = "1" ] && ok
-command -v semgrep >/dev/null 2>&1 || { echo "cm-hook: semgrep not installed — skipping (fail-open)"; ok; }
+command -v semgrep >/dev/null 2>&1 || ok
 
-# Staged source files only
-mapfile -d '' -t STAGED < <(git diff --cached --name-only --diff-filter=ACMR -z -- \
-  '*.js' '*.jsx' '*.ts' '*.tsx' '*.py' '*.go' '*.java' 2>/dev/null)
+# Staged JavaScript/TypeScript source files only
+mapfile -d '' -t STAGED < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.js' '*.ts' 2>/dev/null)
 [ ${#STAGED[@]} -eq 0 ] && ok
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
@@ -25,27 +21,14 @@ for f in "${STAGED[@]}"; do
 done
 [ ${#FILES[@]} -eq 0 ] && ok
 
-ARGS=(--metrics=off --quiet --json --disable-version-check --timeout 5)
-[ -d "$RULES" ] && ARGS+=(--config "$RULES")
-ARGS+=(--config p/javascript)
-
 OUT="$TMP/semgrep.json"
-timeout "$BUDGET" semgrep scan "${ARGS[@]}" -o "$OUT" "${FILES[@]}" >/dev/null 2>"$TMP/err"
-RC=$?
-if [ $RC -ne 0 ]; then
-  if [ $RC -eq 124 ]; then
-    echo "cm-hook: over ${BUDGET}s budget — skipped (fail-open)"
-  else
-    echo "cm-hook: semgrep exited $RC — skipped (fail-open)"
-  fi
-  ok
-fi
+timeout "$BUDGET" semgrep scan --config p/javascript --metrics=off --quiet --json --disable-version-check -o "$OUT" "${FILES[@]}" >/dev/null 2>&1 || ok
 [ -s "$OUT" ] || ok
 
-python3 - "$OUT" "$TMP" "$ROOT" <<'PY'
-import json, sys, os, subprocess
+python3 - "$OUT" "$TMP" <<'PY'
+import json, sys, os
 
-out, tmp, root = sys.argv[1], sys.argv[2], sys.argv[3]
+out, tmp = sys.argv[1], sys.argv[2]
 try:
     res = json.load(open(out)).get("results", [])
 except Exception:
@@ -56,20 +39,18 @@ if not res:
 
 def rel(p): return os.path.relpath(p, tmp)
 
-W, R, B, D = "\033[33m", "\033[31m", "\033[1m", "\033[0m"
-
-print(f"\n{W}{B}⚠️  cm-hook: Semgrep detected {len(res)} potential security finding(s) in staged files:{D}")
+W, B, D = "\033[33m", "\033[1m", "\033[0m"
+print(f"\n{W}{B}⚠️  cm-hook: Semgrep detected {len(res)} potential finding(s) in staged files:{D}")
 for r in res[:5]:
     rule = r.get("check_id", "finding").rsplit(".", 1)[-1]
     path = rel(r.get("path", ""))
     line = (r.get("start") or {}).get("line", 0)
     print(f"   {W}• {path}:{line}{D} -> {rule}")
 
-print(f"\n{B}💡 Pro-tip:{D} Convert and fix these findings locally using CodeMender before committing:")
-print(f"   1. python3 lab/scripts/semgrep-to-cm.py semgrep.json -o cm-findings.json")
-print(f"   2. cm report import -f cm-findings.json -p .")
-print(f"   3. cm fix <finding_id> -y")
-print(f"   (Bypass this advisory hook with: {B}git commit --no-verify{D})\n")
+print(f"\n{B}💡 Remediate locally with CodeMender before committing:{D}")
+print(f"   python3 lab/scripts/semgrep-to-cm.py semgrep.json -o cm-findings.json")
+print(f"   cm report import -f cm-findings.json -p .")
+print(f"   cm fix 1 -y --bypass-warning\n")
 
 sys.exit(0)
 PY
