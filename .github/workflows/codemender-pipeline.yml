@@ -22,6 +22,7 @@ env:
 jobs:
   codemender-security:
     name: Scan, Identify, and Patch
+    if: ${{ github.repository != 'icraytho/codemender-wif-lab-starter' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60 
 
