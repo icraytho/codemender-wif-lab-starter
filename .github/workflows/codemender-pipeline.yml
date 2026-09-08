@@ -15,9 +15,10 @@ permissions:
   id-token: write          # mint the GitHub OIDC token WIF exchanges for GCP creds
 
 env:
-  SCAN_PATH: src
+  SCAN_PATH: src/services
   CM_BUNDLED: lab/bin/cm-linux
   CM_FIX_LIMIT: "1"
+  CM_MODEL: gemini-3.8-flash
 
 jobs:
   codemender-security:
@@ -66,7 +67,7 @@ jobs:
       - name: CodeMender Scan (cm find)
         id: scan
         run: |
-          cm find "$SCAN_PATH" -y 2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log"
+          cm find "$SCAN_PATH" -y --unrestricted --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log"
 
       - name: Export Security Report (cm report -f json)
         if: ${{ always() && steps.scan.conclusion != 'skipped' }}
@@ -85,7 +86,7 @@ jobs:
           set -uo pipefail
           FIX_COUNT=0
           for FID in ${{ steps.triage.outputs.fix_ids }}; do
-            cm fix "$FID" -y --bypass-warning 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+            cm fix "$FID" -y --bypass-warning --unrestricted --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
             python3 .github/scripts/extract_cm_diff.py "$RUNNER_TEMP/fix-$FID.cm.log" > "$RUNNER_TEMP/fix-$FID.patch" || true
             if [ -s "$RUNNER_TEMP/fix-$FID.patch" ]; then
               if git apply --check -p1 "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
