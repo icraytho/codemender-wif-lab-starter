@@ -2,15 +2,24 @@ import json
 import os
 import sys
 
-# Statuses that mean "cm looked at this again and does not believe it".
-# Anything else, including an inconclusive or missing status, is treated as
-# still worth fixing. Verification staying silent is not the same as
-# verification saying no.
-BLOCKING = {"DISMISSED", "EXPLOIT_FAILED"}
+# Exit codes are the interface here: the pipeline loop runs this inside an `if`,
+# so the verdict has to come back as a status, not as a parsed string.
+EXIT_FIX = 0      # go ahead and remediate
+EXIT_SKIP = 3     # verification does not believe this finding
+EXIT_USAGE = 1
+
+# Only an outright dismissal blocks remediation.
+#
+# EXPLOIT_FAILED deliberately does NOT block. cm only attempts an exploit once
+# the agent is already at 70%+ confidence, so that status means "confident but
+# could not build a working proof", which is not evidence the bug is fake. A
+# missing or inconclusive status does not block either: verification going
+# quiet is not the same as verification saying no.
+BLOCKING = {"DISMISSED"}
 
 if len(sys.argv) < 3:
     print("Usage: python3 cm_verdict.py <path_to_report.json> <finding_id>")
-    sys.exit(1)
+    sys.exit(EXIT_USAGE)
 
 report_path, finding_id = sys.argv[1], sys.argv[2]
 
@@ -35,27 +44,24 @@ for finding in findings:
         break
 
 if match is None:
-    status = "NOT_FOUND"
-    confidence = ""
+    status, confidence = "NOT_FOUND", ""
 else:
     status = (match.get('Status') or match.get('status') or '').upper() or "UNKNOWN"
     confidence = match.get('Confidence', match.get('confidence', ''))
 
-blocked = status in BLOCKING
-fix_id = "" if blocked else finding_id
+print(f"  status:     {status}" + (f" (confidence: {confidence}%)" if confidence != "" else ""))
 
-with open(os.environ.get('GITHUB_OUTPUT', 'output.txt'), 'a') as f:
-    f.write(f"verdict={status}\n")
-    f.write(f"fix_id={fix_id}\n")
+if status in BLOCKING:
+    print("  verdict:    dismissed as not exploitable. Skipping remediation.")
+    sys.exit(EXIT_SKIP)
 
-print(f"Finding:    {finding_id}")
-print(f"Status:     {status}" + (f" (confidence: {confidence}%)" if confidence != "" else ""))
-
-if blocked:
-    print("Verdict:    not exploitable. Skipping remediation for this finding.")
+if status == "VERIFIED":
+    print("  verdict:    confirmed exploitable. Remediating.")
+elif status == "EXPLOIT_FAILED":
+    print("  verdict:    believed real but no working exploit was produced. Remediating anyway.")
 elif status == "NOT_FOUND":
-    print("Verdict:    finding missing from the report. Proceeding with remediation anyway.")
-elif status == "VERIFIED":
-    print("Verdict:    confirmed exploitable. Proceeding with remediation.")
+    print("  verdict:    finding missing from the report. Remediating anyway.")
 else:
-    print("Verdict:    inconclusive. Proceeding with remediation.")
+    print("  verdict:    inconclusive. Remediating anyway.")
+
+sys.exit(EXIT_FIX)

@@ -33,16 +33,21 @@ permissions:
                            #   short-lived Google Cloud access token. This is
                            #   the single line that makes the lab keyless.
 
-# Settings shared by every step below. Changing SCAN_PATH changes what gets
-# scanned; changing CM_MODEL changes which Gemini model the agent uses.
+# Settings shared by every step below.
+#   SCAN_PATH  one directory. The scan covers everything under it, and keeping
+#              it narrow is what makes this run in minutes rather than hours.
+#   CM_LIMIT   how many findings to verify and fix in a single run. The scan
+#              still reports everything it finds; this only caps the expensive
+#              agentic work that follows.
 env:
   SCAN_PATH: src/services
   CM_BUNDLED: lab/bin/cm-linux
   CM_MODEL: gemini-3.7-flash
+  CM_LIMIT: "1"
 
 jobs:
   codemender-security:
-    name: Scan, Identify, and Patch
+    name: Scan, Verify, and Patch
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -78,20 +83,38 @@ jobs:
           echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/cmbin/cm" --version
 
-      # Create the .codemender/ workspace and local findings database.
+      # Creates the .codemender/ workspace and local findings database, then
+      # tells cm where this project lives.
+      #
+      # project_paths is the filesystem boundary for the agent. It matters more
+      # than it looks. Left unset, cm falls back to whatever it happens to be
+      # working on, which during verification is the single vulnerable file. The
+      # agent then cannot write the .exploit/ directory it needs to prove the
+      # bug, and every finding comes back EXPLOIT_FAILED.
+      #
+      # Setting it to the checkout is the alternative to --unrestricted: the
+      # sandbox stays switched on, it is just told where the project is. The
+      # agent can range across this repository and nowhere else.
       - name: Initialize CodeMender Workspace
         run: |
+          set -euo pipefail
           cm init || true
+          CONFIG="$HOME/.codemender/config.yaml"
+          if ! grep -q '^project_paths:' "$CONFIG" 2>/dev/null; then
+            printf '\nproject_paths:\n  - "%s"\n' "$GITHUB_WORKSPACE" >> "$CONFIG"
+          fi
+          echo "Sandbox scoped to: $GITHUB_WORKSPACE"
 
       - name: CodeMender Scan
         id: scan
         run: |
           # ANSWER 2:
-          #   -y             no prompts; a CI runner has no keyboard
-          #   --model        pin the model for predictable results and latency
-          #   --unrestricted lift the filesystem sandbox so the agent can follow
-          #                  imports and callers outside $SCAN_PATH
-          cm find "$SCAN_PATH" -y --unrestricted --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log"
+          #   -y        no prompts; a CI runner has no keyboard
+          #   --model   pin the model for predictable results and latency
+          #
+          #   No --unrestricted. project_paths already lets the agent follow
+          #   imports and callers across the repo with the sandbox left on.
+          cm find "$SCAN_PATH" -y --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log"
 
       # Re-emit the findings as JSON for the triage script. This is a separate
       # step guarded by always() so that a scan which finds problems still
@@ -101,74 +124,95 @@ jobs:
         run: |
           cm report -f json > "$RUNNER_TEMP/cm-security-report.json" || true
 
-      # Reads the JSON and sets four step outputs: fix_ids, top_fix_id,
-      # max_severity and high_critical. fix_ids holds only the HIGH and CRITICAL
-      # findings sorted most severe first, and top_fix_id is the first of those.
-      # That ordering is the whole point: without it the run could spend its one
-      # fix on a LOW finding. Have a look at the script if you are curious.
+      # Reads the JSON and sets three step outputs: fix_ids, max_severity and
+      # high_critical. fix_ids holds only the HIGH and CRITICAL findings, sorted
+      # most severe first. That ordering is the whole point: without it a run
+      # limited to one fix could spend it on a LOW finding.
       - name: Triage Findings
         id: triage
         run: |
           python3 .github/scripts/cm_triage.py "$RUNNER_TEMP/cm-security-report.json"
 
-      # Confirm the finding is real before spending a fix on it. cm verify
-      # re-analyses it and records a verdict in the local findings database:
-      # VERIFIED when confident, DISMISSED when not.
-      #
-      # --skip-exploit-verification is a deliberate choice. Without it, cm asks
-      # the agent to write an exploit script and then executes that script on
-      # the runner to prove the bug is real. That is worth understanding before
-      # you enable it anywhere. It also means any finding the agent cannot write
-      # a working exploit for is recorded as EXPLOIT_FAILED and never fixed.
-      - name: Verify Top Finding
-        id: verify
-        if: steps.triage.outputs.top_fix_id != ''
+      # Walk the queue, confirm each finding is real, and patch the ones that
+      # survive. Stops after CM_LIMIT findings.
+      - name: Verify and Remediate
+        id: remediate
+        if: steps.triage.outputs.fix_ids != ''
         run: |
           set -uo pipefail
-          TOP_ID="${{ steps.triage.outputs.top_fix_id }}"
-          cm verify "$TOP_ID" -y --unrestricted --skip-exploit-verification \
-            --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/verify.cm.log" || true
 
-          # cm verify exits 0 whatever the verdict, so the answer has to be read
-          # back out of the findings database rather than from the exit code.
-          cm report -f json > "$RUNNER_TEMP/cm-verified-report.json" || true
-          python3 .github/scripts/cm_verdict.py \
-            "$RUNNER_TEMP/cm-verified-report.json" "$TOP_ID"
+          # Needed because this job commits: see the note further down.
+          git config user.name "codemender-bot"
+          git config user.email "codemender-bot@users.noreply.github.com"
 
-      # fix_id is empty when verification dismissed the finding, which skips
-      # this step and, in turn, the pull request.
-      - name: Autonomous Remediation
-        id: fix
-        if: steps.verify.outputs.fix_id != ''
-        run: |
-          set -uo pipefail
-          FID="${{ steps.verify.outputs.fix_id }}"
+          COUNT=0
+          FIXED=0
+          SKIPPED=0
 
-          # ANSWER 3: same three flags as the scan, plus --bypass-warning.
-          #   cm warns before rewriting source files and waits for a human to
-          #   acknowledge it. In CI that rewrite is the whole point, so the
-          #   warning has to be suppressed or the step hangs until timeout.
-          cm fix "$FID" -y --bypass-warning --unrestricted --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+          for FID in ${{ steps.triage.outputs.fix_ids }}; do
+            COUNT=$((COUNT+1))
+            if [ "$COUNT" -gt "$CM_LIMIT" ]; then break; fi
 
-          # Safety net: if cm did not edit the files directly, recover the
-          # patch from the log and apply it by hand.
-          python3 .github/scripts/extract_cm_diff.py \
-            "$RUNNER_TEMP/fix-$FID.cm.log" > "$RUNNER_TEMP/fix-$FID.patch" || true
+            echo "::group::Verify $FID"
+            # cm verify asks the agent to write an exploit and then runs it, so
+            # a VERIFIED finding here has been demonstrated, not just asserted.
+            cm verify "$FID" -y --model "$CM_MODEL" \
+              2>&1 | tee "$RUNNER_TEMP/verify-$FID.cm.log" || true
 
-          if [ -s "$RUNNER_TEMP/fix-$FID.patch" ]; then
-            if git apply --check -p1 "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
-              git apply -p1 "$RUNNER_TEMP/fix-$FID.patch"
-            elif git apply --check -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
-              git apply -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch"
+            # cm verify exits 0 whatever the verdict, so the answer has to be
+            # read back out of the findings database rather than from $?.
+            cm report -f json > "$RUNNER_TEMP/verified-$FID.json" || true
+            echo "::endgroup::"
+
+            if ! python3 .github/scripts/cm_verdict.py \
+                 "$RUNNER_TEMP/verified-$FID.json" "$FID"; then
+              SKIPPED=$((SKIPPED+1))
+              continue
             fi
-          fi
 
-          git --no-pager diff --stat || true
+            echo "::group::Fix $FID"
+            # ANSWER 3: same flags as the scan, plus --bypass-warning.
+            #   cm warns before rewriting source files and waits for a human to
+            #   acknowledge it. In CI that rewrite is the whole point, so the
+            #   warning has to be suppressed or the step hangs until timeout.
+            cm fix "$FID" -y --bypass-warning --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
 
-      # Bundle whatever cm changed into a branch and open a pull request.
+            # Safety net: if cm did not edit the files directly, recover the
+            # patch from the log and apply it by hand.
+            python3 .github/scripts/extract_cm_diff.py \
+              "$RUNNER_TEMP/fix-$FID.cm.log" > "$RUNNER_TEMP/fix-$FID.patch" || true
+
+            if [ -s "$RUNNER_TEMP/fix-$FID.patch" ]; then
+              if git apply --check -p1 "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+                git apply -p1 "$RUNNER_TEMP/fix-$FID.patch"
+              elif git apply --check -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+                git apply -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch"
+              fi
+            fi
+            echo "::endgroup::"
+
+            # Commit before moving on. This is not tidiness, it is required:
+            # cm verify and cm fix both reset the working tree to HEAD before
+            # they start (git checkout HEAD -- . && git clean -fd). Leave this
+            # fix uncommitted and the next loop iteration deletes it.
+            if ! git diff --quiet; then
+              git add -A
+              git commit -q -m "fix(security): CodeMender remediation for $FID"
+              FIXED=$((FIXED+1))
+              echo "Committed fix for $FID"
+            else
+              echo "cm produced no file changes for $FID"
+            fi
+          done
+
+          echo "Considered $COUNT finding(s): $FIXED fixed, $SKIPPED dismissed."
+          echo "fixed=$FIXED" >> "$GITHUB_OUTPUT"
+          git --no-pager log --oneline "origin/main..HEAD" || true
+
+      # Bundle the commits made above into a branch and open a pull request.
       - name: Open Remediation Pull Request
         id: pr
-        if: ${{ steps.fix.outcome == 'success' }}
+        if: steps.remediate.outputs.fixed != '0'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -177,7 +221,7 @@ jobs:
           delete-branch: true
           commit-message: "fix(security): CodeMender autonomous remediation"
           title: "CodeMender: autonomous security remediation"
-          body: "Auto-remediated HIGH/CRITICAL findings via cm fix."
+          body: "Auto-remediated HIGH/CRITICAL findings via cm verify + cm fix."
 
       # The gate. always() guarantees this runs even if an earlier step failed,
       # so a broken scan can never be mistaken for a clean bill of health.
