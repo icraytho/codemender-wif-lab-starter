@@ -1,0 +1,160 @@
+# =============================================================================
+# CodeMender CI/CD Guardrail: REFERENCE SOLUTION
+# =============================================================================
+# This is a completed reference implementation of the codelab pipeline.
+#
+# It lives under lab/solutions/ (outside .github/workflows/) so GitHub Actions
+# never picks it up. Attempt every TODO in
+# lab/templates/codemender-pipeline.template.yaml yourself first, then compare:
+#
+#     diff .github/workflows/codemender-pipeline.yml \
+#          lab/solutions/codemender-pipeline.solution.yaml
+#
+# Everything outside the seven TODO regions is identical to the skeleton, so
+# any diff you see is a decision you made differently. That is worth
+# understanding even when your version also works.
+# =============================================================================
+
+name: CodeMender CI/CD Guardrail
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore: [ '**.md', 'lab/**', '.gitignore' ]
+  workflow_dispatch:
+
+# SOLUTION 1: id-token is the one that matters for WIF. Without it GitHub
+# refuses to mint the OIDC JWT and the auth step fails with
+# "Unable to get ACTIONS_ID_TOKEN_REQUEST_URL". The other two let
+# create-pull-request push a branch and open the PR.
+permissions:
+  contents: write          # push the remediation branch
+  pull-requests: write     # open the autonomous remediation PR
+  id-token: write          # mint the OIDC token WIF exchanges for GCP credentials
+
+env:
+  SCAN_PATH: src/services
+  CM_BUNDLED: lab/bin/cm-linux
+  CM_MODEL: gemini-3.7-flash
+  CM_FIX_LIMIT: "1"
+
+jobs:
+  codemender-security:
+    name: Scan, Identify, and Patch
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # SOLUTION 2: The action writes an ADC credential file to the runner and
+      # exports GOOGLE_APPLICATION_CREDENTIALS, so every later step (including
+      # cm) authenticates automatically. No key material is ever stored.
+      - name: Authenticate to Google Cloud (WIF / ADC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          project_id: ${{ vars.GCP_QUOTA_PROJECT }}
+
+      - name: Install CodeMender CLI (cm)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cmbin"
+          install -m 0755 "$CM_BUNDLED" "$RUNNER_TEMP/cmbin/cm"
+          echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cmbin/cm" --version
+
+      # SOLUTION 3: Creates .codemender/ and the local findings database.
+      # Tolerate failure so a re-run against an existing workspace is a no-op.
+      - name: Initialize CodeMender Workspace
+        run: |
+          cm init || true
+
+      # SOLUTION 4:
+      #   -y             non-interactive; CI has no TTY to answer prompts
+      #   --model        pin the model for reproducible behaviour and latency
+      #   --unrestricted lift the filesystem sandbox so the agent can follow
+      #                  imports and callers outside $SCAN_PATH. Reasonable on
+      #                  an ephemeral runner holding only this repo; think
+      #                  harder before doing it on a shared self-hosted runner.
+      #   tee            keep the full agent transcript for debugging
+      - name: CodeMender Scan
+        id: scan
+        run: |
+          cm find "$SCAN_PATH" -y --unrestricted --model "$CM_MODEL" 2>&1 \
+            | tee "$RUNNER_TEMP/cm-find.log"
+
+      # SOLUTION 5: Separate step guarded by always() so that a scan which
+      # finds problems (and may exit non-zero) still produces a report for
+      # triage. Chaining this onto the scan step would lose the findings.
+      - name: Export Security Report
+        if: always()
+        run: |
+          cm report -f json > "$RUNNER_TEMP/cm-security-report.json" || true
+
+      - name: Triage Findings
+        id: triage
+        run: |
+          python3 .github/scripts/cm_triage.py "$RUNNER_TEMP/cm-security-report.json"
+
+      # SOLUTION 6: cm fix edits the working tree in place. The
+      # extract_cm_diff.py fallback recovers a unified diff from the log and
+      # re-applies it only if `git apply --check` says it has not already
+      # landed, which makes the step safe to run either way. CM_FIX_LIMIT caps
+      # the loop at one fix so the lab completes in a few minutes.
+      - name: Autonomous Remediation
+        id: fix
+        if: ${{ steps.triage.outputs.fix_ids != '' }}
+        run: |
+          set -uo pipefail
+          FIX_COUNT=0
+          for FID in ${{ steps.triage.outputs.fix_ids }}; do
+            cm fix "$FID" -y --bypass-warning --unrestricted --model "$CM_MODEL" 2>&1 \
+              | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+
+            python3 .github/scripts/extract_cm_diff.py \
+              "$RUNNER_TEMP/fix-$FID.cm.log" > "$RUNNER_TEMP/fix-$FID.patch" || true
+
+            if [ -s "$RUNNER_TEMP/fix-$FID.patch" ]; then
+              if git apply --check -p1 "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+                git apply -p1 "$RUNNER_TEMP/fix-$FID.patch"
+              elif git apply --check -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+                git apply -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch"
+              fi
+            fi
+
+            FIX_COUNT=$((FIX_COUNT+1))
+            if [ "$FIX_COUNT" -ge "$CM_FIX_LIMIT" ]; then break; fi
+          done
+
+          git --no-pager diff --stat || true
+
+      - name: Open Remediation Pull Request
+        id: pr
+        if: ${{ steps.fix.outcome == 'success' }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: codemender/auto-remediation
+          delete-branch: true
+          commit-message: "fix(security): CodeMender autonomous remediation"
+          title: "CodeMender: autonomous security remediation"
+          body: "Auto-remediated HIGH/CRITICAL findings via cm fix."
+
+      # SOLUTION 7: always() guarantees the gate runs even when an earlier step
+      # failed. Without it, a failure upstream would skip the gate and the job
+      # could report a misleading result.
+      - name: Security Gate
+        if: always()
+        run: |
+          COUNT="${{ steps.triage.outputs.high_critical }}"
+          COUNT="${COUNT:-0}"
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::error title=Deployment blocked::CodeMender found $COUNT HIGH/CRITICAL finding(s). Failing the pipeline."
+            exit 1
+          fi
