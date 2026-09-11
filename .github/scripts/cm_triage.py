@@ -46,8 +46,12 @@ for position, finding in enumerate(findings):
 candidates.sort(key=lambda c: (-c[0], c[1]))
 fix_ids = [c[3] for c in candidates]
 
+# The pipeline verifies and fixes exactly one finding per run: this one.
+top_fix_id = fix_ids[0] if fix_ids else ""
+
 with open(os.environ.get('GITHUB_OUTPUT', 'output.txt'), 'a') as f:
     f.write(f"fix_ids={' '.join(fix_ids)}\n")
+    f.write(f"top_fix_id={top_fix_id}\n")
     f.write(f"max_severity={max_sev_name}\n")
     f.write(f"high_critical={high_critical_count}\n")
 

@@ -39,7 +39,6 @@ env:
   SCAN_PATH: src/services
   CM_BUNDLED: lab/bin/cm-linux
   CM_MODEL: gemini-3.7-flash
-  CM_FIX_LIMIT: "1"
 
 jobs:
   codemender-security:
@@ -102,47 +101,67 @@ jobs:
         run: |
           cm report -f json > "$RUNNER_TEMP/cm-security-report.json" || true
 
-      # Reads the JSON and sets three step outputs: fix_ids, max_severity and
-      # high_critical. fix_ids holds only the HIGH and CRITICAL findings, sorted
-      # most severe first, so the loop below never spends its one fix on a LOW
-      # finding. Have a look at the script if you are curious.
+      # Reads the JSON and sets four step outputs: fix_ids, top_fix_id,
+      # max_severity and high_critical. fix_ids holds only the HIGH and CRITICAL
+      # findings sorted most severe first, and top_fix_id is the first of those.
+      # That ordering is the whole point: without it the run could spend its one
+      # fix on a LOW finding. Have a look at the script if you are curious.
       - name: Triage Findings
         id: triage
         run: |
           python3 .github/scripts/cm_triage.py "$RUNNER_TEMP/cm-security-report.json"
 
-      - name: Autonomous Remediation
-        id: fix
-        if: ${{ steps.triage.outputs.fix_ids != '' }}
+      # Confirm the finding is real before spending a fix on it. cm verify
+      # re-analyses it and records a verdict in the local findings database:
+      # VERIFIED when confident, DISMISSED when not.
+      #
+      # --skip-exploit-verification is a deliberate choice. Without it, cm asks
+      # the agent to write an exploit script and then executes that script on
+      # the runner to prove the bug is real. That is worth understanding before
+      # you enable it anywhere. It also means any finding the agent cannot write
+      # a working exploit for is recorded as EXPLOIT_FAILED and never fixed.
+      - name: Verify Top Finding
+        id: verify
+        if: steps.triage.outputs.top_fix_id != ''
         run: |
           set -uo pipefail
-          FIX_COUNT=0
-          for FID in ${{ steps.triage.outputs.fix_ids }}; do
+          TOP_ID="${{ steps.triage.outputs.top_fix_id }}"
+          cm verify "$TOP_ID" -y --unrestricted --skip-exploit-verification \
+            --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/verify.cm.log" || true
 
-            # ANSWER 3: same three flags as the scan, plus --bypass-warning.
-            #   cm warns before rewriting source files and waits for a human to
-            #   acknowledge it. In CI that rewrite is the whole point, so the
-            #   warning has to be suppressed or the step hangs until timeout.
-            cm fix "$FID" -y --bypass-warning --unrestricted --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+          # cm verify exits 0 whatever the verdict, so the answer has to be read
+          # back out of the findings database rather than from the exit code.
+          cm report -f json > "$RUNNER_TEMP/cm-verified-report.json" || true
+          python3 .github/scripts/cm_verdict.py \
+            "$RUNNER_TEMP/cm-verified-report.json" "$TOP_ID"
 
-            # Safety net: if cm did not edit the files directly, recover the
-            # patch from the log and apply it by hand.
-            python3 .github/scripts/extract_cm_diff.py \
-              "$RUNNER_TEMP/fix-$FID.cm.log" > "$RUNNER_TEMP/fix-$FID.patch" || true
+      # fix_id is empty when verification dismissed the finding, which skips
+      # this step and, in turn, the pull request.
+      - name: Autonomous Remediation
+        id: fix
+        if: steps.verify.outputs.fix_id != ''
+        run: |
+          set -uo pipefail
+          FID="${{ steps.verify.outputs.fix_id }}"
 
-            if [ -s "$RUNNER_TEMP/fix-$FID.patch" ]; then
-              if git apply --check -p1 "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
-                git apply -p1 "$RUNNER_TEMP/fix-$FID.patch"
-              elif git apply --check -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
-                git apply -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch"
-              fi
+          # ANSWER 3: same three flags as the scan, plus --bypass-warning.
+          #   cm warns before rewriting source files and waits for a human to
+          #   acknowledge it. In CI that rewrite is the whole point, so the
+          #   warning has to be suppressed or the step hangs until timeout.
+          cm fix "$FID" -y --bypass-warning --unrestricted --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+
+          # Safety net: if cm did not edit the files directly, recover the
+          # patch from the log and apply it by hand.
+          python3 .github/scripts/extract_cm_diff.py \
+            "$RUNNER_TEMP/fix-$FID.cm.log" > "$RUNNER_TEMP/fix-$FID.patch" || true
+
+          if [ -s "$RUNNER_TEMP/fix-$FID.patch" ]; then
+            if git apply --check -p1 "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+              git apply -p1 "$RUNNER_TEMP/fix-$FID.patch"
+            elif git apply --check -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+              git apply -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch"
             fi
-
-            # Stop after CM_FIX_LIMIT fixes so the lab finishes quickly. At
-            # the default of 1 this patches the single most severe finding.
-            FIX_COUNT=$((FIX_COUNT+1))
-            if [ "$FIX_COUNT" -ge "$CM_FIX_LIMIT" ]; then break; fi
-          done
+          fi
 
           git --no-pager diff --stat || true
 
