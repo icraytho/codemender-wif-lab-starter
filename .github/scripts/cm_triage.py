@@ -17,19 +17,34 @@ findings = data.get('findings', []) if isinstance(data, dict) else data
 if not isinstance(findings, list): findings = []
 
 severities = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
-max_sev_value, max_sev_name = 0, "NONE"
-fix_ids = []
-high_critical_count = 0
+# Only these are worth spending an autonomous fix on. Anything below HIGH is
+# reported but never patched automatically.
+FIXABLE = ("CRITICAL", "HIGH")
 
-for finding in findings:
+max_sev_value, max_sev_name = 0, "NONE"
+high_critical_count = 0
+candidates = []
+
+for position, finding in enumerate(findings):
     # Handle both lowercase (custom json) and uppercase (cm schema) keys
-    sev = finding.get('Severity', finding.get('severity', 'LOW')).upper()
-    fid = finding.get('FindingID', finding.get('id', ''))
-    if fid: fix_ids.append(fid)
-    if severities.get(sev, 0) > max_sev_value:
-        max_sev_value, max_sev_name = severities.get(sev, 0), sev
-    if sev in ["CRITICAL", "HIGH"]:
+    sev = (finding.get('Severity') or finding.get('severity') or 'LOW').upper()
+    fid = finding.get('FindingID') or finding.get('id') or ''
+    sev_value = severities.get(sev, 0)
+
+    if sev_value > max_sev_value:
+        max_sev_value, max_sev_name = sev_value, sev
+    if sev in FIXABLE:
         high_critical_count += 1
+        if fid:
+            # Keep the report position so equal severities stay in the order
+            # CodeMender found them.
+            candidates.append((sev_value, position, sev, fid))
+
+# Most severe first; CRITICAL always outranks HIGH. Without this the fix loop
+# takes whatever happened to be first in the report, which may be the least
+# important finding of the run.
+candidates.sort(key=lambda c: (-c[0], c[1]))
+fix_ids = [c[3] for c in candidates]
 
 with open(os.environ.get('GITHUB_OUTPUT', 'output.txt'), 'a') as f:
     f.write(f"fix_ids={' '.join(fix_ids)}\n")
@@ -37,3 +52,11 @@ with open(os.environ.get('GITHUB_OUTPUT', 'output.txt'), 'a') as f:
     f.write(f"high_critical={high_critical_count}\n")
 
 print(f"Triage complete. Max severity: {max_sev_name}")
+print(f"Findings: {len(findings)} total, {high_critical_count} HIGH/CRITICAL")
+
+if candidates:
+    print("Remediation queue (most severe first):")
+    for _, _, sev, fid in candidates:
+        print(f"  {sev:<8} {fid}")
+else:
+    print("No HIGH/CRITICAL findings. Nothing will be auto-remediated.")

@@ -103,7 +103,9 @@ jobs:
           cm report -f json > "$RUNNER_TEMP/cm-security-report.json" || true
 
       # Reads the JSON and sets three step outputs: fix_ids, max_severity and
-      # high_critical. Have a look at the script if you are curious.
+      # high_critical. fix_ids holds only the HIGH and CRITICAL findings, sorted
+      # most severe first, so the loop below never spends its one fix on a LOW
+      # finding. Have a look at the script if you are curious.
       - name: Triage Findings
         id: triage
         run: |
@@ -136,7 +138,8 @@ jobs:
               fi
             fi
 
-            # Stop after CM_FIX_LIMIT fixes so the lab finishes quickly.
+            # Stop after CM_FIX_LIMIT fixes so the lab finishes quickly. At
+            # the default of 1 this patches the single most severe finding.
             FIX_COUNT=$((FIX_COUNT+1))
             if [ "$FIX_COUNT" -ge "$CM_FIX_LIMIT" ]; then break; fi
           done
