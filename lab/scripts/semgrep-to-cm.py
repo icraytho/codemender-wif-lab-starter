@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
 """semgrep JSON -> the 'simple JSON' shape `cm report import` accepts.
 
-    semgrep scan --config=p/javascript --json -o semgrep.json .
-    python3 lab/scripts/semgrep-to-cm.py semgrep.json -o cm-findings.json
-    cm report import -f cm-findings.json -p .
+    semgrep scan --config=p/javascript --json -o /tmp/semgrep.json src/
+    python3 lab/scripts/semgrep-to-cm.py /tmp/semgrep.json -o /tmp/cm-findings.json
+    cm report import -f /tmp/cm-findings.json -p .
+
+The intermediate files live in /tmp so they never land in the repository, where
+they would otherwise be picked up by `git add -A` and read by the fix agent.
+
+Each emitted record uses these keys:
+
+    file_path   path as semgrep reported it, relative to the scan CWD
+    line        1-based start line
+    title       rule id, last segment, title-cased
+    message     "[rule.id] semgrep's message"
+    severity    HIGH | MEDIUM | LOW, mapped from ERROR | WARNING | INFO
+    vuln_type   CWE id (e.g. "CWE-95"), or "CWE-noinfo" when absent
+
+Paths are passed through untouched, so `cm report import -p <dir>` is what
+anchors them. Moving this file's input or output does not affect resolution.
 """
 import argparse
 import json

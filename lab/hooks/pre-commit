@@ -62,11 +62,11 @@ if len(res) > 5:
 
 print(f"""
 {B}Remediate with CodeMender, then commit again:{D}
-   semgrep scan --config=p/javascript --json -o semgrep.json src/
-   python3 lab/scripts/semgrep-to-cm.py semgrep.json -o cm-findings.json
-   cm report import -f cm-findings.json -p .
+   semgrep scan --config=p/javascript --json -o /tmp/semgrep.json src/
+   python3 lab/scripts/semgrep-to-cm.py /tmp/semgrep.json -o /tmp/cm-findings.json
+   cm report import -f /tmp/cm-findings.json -p .
    cm report                      # copy the finding ID you want
-   cm fix <FINDING_ID> -y --bypass-warning
+   cm fix <FINDING_ID> -y --bypass-warning --context "<file and what to fix>"
 
 {B}Stage the file you fixed,{D} not the whole tree. `git add src/` picks up
 every modified file, including anything an open editor tab wrote back to disk

@@ -85,10 +85,23 @@ jobs:
           echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/cmbin/cm" --version
 
-      # Install project dependencies so CodeMender agents can verify exploits
-      # and run tests locally without missing-module errors.
+      # Install project dependencies before any agent runs. This is purely a
+      # speed optimisation, not a correctness requirement.
+      #
+      # Without it, cm verify cannot resolve `express` while building its
+      # exploit harness, and the agent responds by searching the entire
+      # filesystem for it: `find / -name express`. That hits the 30 second
+      # command timeout, twice, for a full minute of wasted wall clock.
+      #
+      # node_modules/ is in .gitignore, so it survives the `git clean -fd`
+      # workspace reset that runs before every agent command. Install once
+      # here and it stays available for find, verify and fix alike.
+      #
+      # `|| true` is deliberate. A registry outage should not take down the
+      # security pipeline: the run simply degrades to the slower behaviour it
+      # had before this step existed.
       - name: Install Application Dependencies
-        run: npm install --no-audit --no-fund
+        run: npm install --no-audit --no-fund || true
 
       # Creates the .codemender/ workspace and local findings database, then
       # tells cm two things about this project: where it lives, and how to
