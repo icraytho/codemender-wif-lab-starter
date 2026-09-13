@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-# Pre-commit hook: Fast Semgrep scan on staged files (fails-open)
+# Pre-commit hook: fast Semgrep scan on staged files.
+#
+# Fails CLOSED on findings. It exits non-zero so the commit is aborted, which
+# is the whole point of a shift-left gate: a warning you can scroll past is not
+# a control. It still fails OPEN on infrastructure problems (semgrep missing,
+# timeout, unparseable output), because a broken scanner must never wedge a
+# developer's ability to commit.
+#
+# Escape hatches, in order of preference:
+#   git commit --no-verify        skip all hooks for one commit
+#   CM_HOOK_SKIP=1 git commit     skip just this hook
+#   CM_HOOK_BUDGET=30             raise the scan timeout in seconds
 set -uo pipefail
 
 BUDGET="${CM_HOOK_BUDGET:-10}"
@@ -32,25 +43,38 @@ out, tmp = sys.argv[1], sys.argv[2]
 try:
     res = json.load(open(out)).get("results", [])
 except Exception:
-    sys.exit(0)
+    sys.exit(0)          # unparseable output is an infra problem: fail open
 
 if not res:
     sys.exit(0)
 
 def rel(p): return os.path.relpath(p, tmp)
 
-W, B, D = "\033[33m", "\033[1m", "\033[0m"
-print(f"\n{W}{B}⚠️  cm-hook: Semgrep detected {len(res)} potential finding(s) in staged files:{D}")
+R, B, D = "\033[31m", "\033[1m", "\033[0m"
+print(f"\n{R}{B}❌ cm-hook: commit blocked. Semgrep found {len(res)} finding(s) in staged files:{D}")
 for r in res[:5]:
     rule = r.get("check_id", "finding").rsplit(".", 1)[-1]
     path = rel(r.get("path", ""))
     line = (r.get("start") or {}).get("line", 0)
-    print(f"   {W}• {path}:{line}{D} -> {rule}")
+    print(f"   {R}• {path}:{line}{D} -> {rule}")
+if len(res) > 5:
+    print(f"   ...and {len(res) - 5} more")
 
-print(f"\n{B}💡 Remediate locally with CodeMender before committing:{D}")
-print(f"   python3 lab/scripts/semgrep-to-cm.py semgrep.json -o cm-findings.json")
-print(f"   cm report import -f cm-findings.json -p .")
-print(f"   cm fix 1 -y --bypass-warning\n")
+print(f"""
+{B}Remediate with CodeMender, then commit again:{D}
+   semgrep scan --config=p/javascript --json -o semgrep.json src/
+   python3 lab/scripts/semgrep-to-cm.py semgrep.json -o cm-findings.json
+   cm report import -f cm-findings.json -p .
+   cm report                      # copy the finding ID you want
+   cm fix <FINDING_ID> -y --bypass-warning
 
-sys.exit(0)
+{B}Re-import before every fix.{D} Findings from a single import share one
+session, and `cm fix` restores that session's workspace state. Fixing a second
+finding from an old import silently rolls back your first fix, which is very
+likely what this hook just caught.
+
+{B}To commit anyway:{D} git commit --no-verify
+""")
+
+sys.exit(1)
 PY
