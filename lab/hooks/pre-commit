@@ -68,10 +68,10 @@ print(f"""
    cm report                      # copy the finding ID you want
    cm fix <FINDING_ID> -y --bypass-warning
 
-{B}Re-import before every fix.{D} Findings from a single import share one
-session, and `cm fix` restores that session's workspace state. Fixing a second
-finding from an old import silently rolls back your first fix, which is very
-likely what this hook just caught.
+{B}Stage the file you fixed,{D} not the whole tree. `git add src/` picks up
+every modified file, including anything an open editor tab wrote back to disk
+while the agent was working. Name the file, then check it with:
+   git show --stat HEAD
 
 {B}To commit anyway:{D} git commit --no-verify
 """)
