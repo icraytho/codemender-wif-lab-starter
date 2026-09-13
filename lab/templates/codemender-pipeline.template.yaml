@@ -91,6 +91,11 @@ jobs:
           echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/cmbin/cm" --version
 
+      # Install project dependencies so CodeMender agents can verify exploits
+      # and run tests locally without missing-module errors.
+      - name: Install Application Dependencies
+        run: npm install --no-audit --no-fund
+
       # Creates the .codemender/ workspace and local findings database, then
       # tells cm two things about this project: where it lives, and how to
       # undo changes to it.
