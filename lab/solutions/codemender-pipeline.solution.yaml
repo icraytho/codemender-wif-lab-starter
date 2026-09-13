@@ -74,10 +74,12 @@ jobs:
           project_id: ${{ vars.GCP_QUOTA_PROJECT }}
 
       # Install the CodeMender binary that ships inside this repo, and add it
-      # to PATH so later steps can just call `cm`.
+      # to PATH so later steps can just call `cm`. Also point /bin/sh to bash
+      # so CodeMender's exploit verification runner supports bash scripts.
       - name: Install CodeMender CLI (cm)
         run: |
           set -euo pipefail
+          sudo ln -sf /bin/bash /bin/sh
           mkdir -p "$RUNNER_TEMP/cmbin"
           install -m 0755 "$CM_BUNDLED" "$RUNNER_TEMP/cmbin/cm"
           echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
@@ -117,7 +119,8 @@ jobs:
           if ! grep -q '^project_paths:' "$CONFIG" 2>/dev/null; then
             printf '\nproject_paths:\n  - "%s"\n' "$GITHUB_WORKSPACE" >> "$CONFIG"
           fi
-          if ! grep -q '^vcs:' "$CONFIG" 2>/dev/null; then
+          sed -i 's/type: ""/type: "git"/' "$CONFIG" 2>/dev/null || true
+          if ! grep -q 'type: "git"' "$CONFIG" 2>/dev/null && ! grep -q 'type: git' "$CONFIG" 2>/dev/null; then
             printf '\nvcs:\n  type: git\n' >> "$CONFIG"
           fi
           echo "Sandbox scoped to: $GITHUB_WORKSPACE"
