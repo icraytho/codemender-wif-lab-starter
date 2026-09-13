@@ -276,6 +276,31 @@ jobs:
           title: "CodeMender: autonomous security remediation"
           body: "Auto-remediated HIGH/CRITICAL findings via cm verify + cm fix."
 
+      # Generate visual HTML report with finding details, verification exploits,
+      # and patch diffs. Uploaded as a workflow artifact so participants can
+      # download and inspect it in their browser.
+      - name: Generate CodeMender HTML Report
+        if: always()
+        run: |
+          cm report -f html || true
+          if [ -f "$HOME/.codemender/reports/report.html" ]; then
+            cp "$HOME/.codemender/reports/report.html" "$RUNNER_TEMP/codemender-report.html"
+          fi
+
+      - name: Upload HTML Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemender-html-report
+          path: ${{ runner.temp }}/codemender-report.html
+          if-no-files-found: ignore
+
+      # Summarize LLM token usage across all commands executed in this run.
+      - name: CodeMender Token Usage Stats
+        if: always()
+        run: |
+          cm stats </dev/null || true
+
       # The gate. always() guarantees this runs even if an earlier step failed,
       # so a broken scan can never be mistaken for a clean bill of health.
       #
