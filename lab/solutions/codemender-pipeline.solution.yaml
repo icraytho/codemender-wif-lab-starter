@@ -84,7 +84,8 @@ jobs:
           "$RUNNER_TEMP/cmbin/cm" --version
 
       # Creates the .codemender/ workspace and local findings database, then
-      # tells cm where this project lives.
+      # tells cm two things about this project: where it lives, and how to
+      # undo changes to it.
       #
       # project_paths is the filesystem boundary for the agent. It matters more
       # than it looks. Left unset, cm falls back to whatever it happens to be
@@ -95,6 +96,19 @@ jobs:
       # Setting it to the checkout is the alternative to --unrestricted: the
       # sandbox stays switched on, it is just told where the project is. The
       # agent can range across this repository and nowhere else.
+      #
+      # vcs.type tells cm this is a Git repository. Without it cm prints
+      # "No reset command configured" before every scan, verification and fix,
+      # and silently skips the workspace reset that is supposed to give each
+      # agent run a clean starting point. Setting it to git enables the
+      # built-in reset, which is:
+      #
+      #     git checkout HEAD -- . && git clean -fd
+      #
+      # Note there is no -x on that clean, so it spares ignored files. That is
+      # why .gitignore in this repo covers .codemender/ and gha-creds-*.json:
+      # those entries are not tidiness, they stop cm deleting its own findings
+      # database and this job's credentials halfway through the run.
       - name: Initialize CodeMender Workspace
         run: |
           set -euo pipefail
@@ -102,6 +116,9 @@ jobs:
           CONFIG="$HOME/.codemender/config.yaml"
           if ! grep -q '^project_paths:' "$CONFIG" 2>/dev/null; then
             printf '\nproject_paths:\n  - "%s"\n' "$GITHUB_WORKSPACE" >> "$CONFIG"
+          fi
+          if ! grep -q '^vcs:' "$CONFIG" 2>/dev/null; then
+            printf '\nvcs:\n  type: git\n' >> "$CONFIG"
           fi
           echo "Sandbox scoped to: $GITHUB_WORKSPACE"
 
@@ -150,13 +167,22 @@ jobs:
           SKIPPED=0
 
           for FID in ${{ steps.triage.outputs.fix_ids }}; do
+            if [ "$COUNT" -ge "$CM_LIMIT" ]; then break; fi
             COUNT=$((COUNT+1))
-            if [ "$COUNT" -gt "$CM_LIMIT" ]; then break; fi
 
             echo "::group::Verify $FID"
             # cm verify asks the agent to write an exploit and then runs it, so
             # a VERIFIED finding here has been demonstrated, not just asserted.
-            cm verify "$FID" -y --model "$CM_MODEL" \
+            #
+            # Two separate flags are needed to make that work unattended, and
+            # they are not interchangeable. -y answers the per-action prompts.
+            # --bypass-warning answers a different gate: the one-off warning
+            # that the agent may run commands and write files. That gate is
+            # keyed on whether stdin is a terminal, so it always fires in CI.
+            # Omit --bypass-warning and verification dies on its first step
+            # with "warning not acknowledged", the finding stays OPEN, and the
+            # run quietly degrades to fixing without ever having verified.
+            cm verify "$FID" -y --bypass-warning --model "$CM_MODEL" \
               2>&1 | tee "$RUNNER_TEMP/verify-$FID.cm.log" || true
 
             # cm verify exits 0 whatever the verdict, so the answer has to be
@@ -171,10 +197,13 @@ jobs:
             fi
 
             echo "::group::Fix $FID"
-            # ANSWER 3: same flags as the scan, plus --bypass-warning.
-            #   cm warns before rewriting source files and waits for a human to
-            #   acknowledge it. In CI that rewrite is the whole point, so the
-            #   warning has to be suppressed or the step hangs until timeout.
+            # ANSWER 3: identical to the cm verify call above.
+            #   -y                 no prompts; a CI runner has no keyboard
+            #   --bypass-warning   acknowledge that the agent may run commands
+            #                      and write files. This is a separate gate
+            #                      from -y and it fires whenever stdin is not a
+            #                      terminal, which in CI is always.
+            #   --model            pin the model for predictable results
             cm fix "$FID" -y --bypass-warning --model "$CM_MODEL" 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
 
             # Safety net: if cm did not edit the files directly, recover the
@@ -193,8 +222,16 @@ jobs:
 
             # Commit before moving on. This is not tidiness, it is required:
             # cm verify and cm fix both reset the working tree to HEAD before
-            # they start (git checkout HEAD -- . && git clean -fd). Leave this
-            # fix uncommitted and the next loop iteration deletes it.
+            # they start (git checkout HEAD -- . && git clean -fd, enabled by
+            # the vcs.type setting above). Leave this fix uncommitted and the
+            # next loop iteration deletes it.
+            #
+            # git add -A stages everything, including files the agent created
+            # that git has never seen. That is deliberate, because a real fix
+            # sometimes adds a new module. It is also why .gitignore has to be
+            # right: without it this line sweeps up the WIF credentials file,
+            # the .cm_project markers, and the working exploit payloads under
+            # .exploit/, and publishes all of them in the pull request.
             if ! git diff --quiet; then
               git add -A
               git commit -q -m "fix(security): CodeMender remediation for $FID"
@@ -225,12 +262,19 @@ jobs:
 
       # The gate. always() guarantees this runs even if an earlier step failed,
       # so a broken scan can never be mistaken for a clean bill of health.
+      #
+      # The gate counts what the scan found, not what is left after the fixes.
+      # That is intentional: the fixes are sitting in a pull request that a
+      # human has not reviewed or merged yet, so from the perspective of this
+      # commit nothing has actually been remediated.
       - name: Security Gate
         if: always()
         run: |
-          COUNT="${{ steps.triage.outputs.high_critical }}"
-          COUNT="${COUNT:-0}"
-          if [ "$COUNT" -gt 0 ]; then
-            echo "::error title=Deployment blocked::CodeMender found $COUNT HIGH/CRITICAL finding(s). Failing the pipeline."
+          FOUND="${{ steps.triage.outputs.high_critical }}"
+          PATCHED="${{ steps.remediate.outputs.fixed }}"
+          FOUND="${FOUND:-0}"
+          PATCHED="${PATCHED:-0}"
+          if [ "$FOUND" -gt 0 ]; then
+            echo "::error title=Deployment blocked::CodeMender found $FOUND HIGH/CRITICAL finding(s). $PATCHED proposed for remediation in the pull request, $((FOUND-PATCHED)) not yet addressed. Failing the pipeline."
             exit 1
           fi
